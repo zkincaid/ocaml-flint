@@ -10,6 +10,8 @@ module FMPZ = struct
 
     let mk_fmpz () : fmpz_t =
       allocate_n ~count:1 ~finalise:C.Function.fmpz_clear fmpz
+
+    let set ~dst ~src = fmpz_set dst src
   end
 
   module External = struct
@@ -65,6 +67,10 @@ module FMPQ = struct
 
   let of_q q = mk (FMPZ.of_z q.Q.num) (FMPZ.of_z q.Q.den)
   let to_q q = Q.make (FMPZ.to_z (q |-> FMPQ.num)) (FMPZ.to_z (q |-> FMPQ.den))
+  let pp fmt q =
+    Format.fprintf fmt "%a/%a"
+      FMPZ.pp (q |-> FMPQ.num)
+      FMPZ.pp (q |-> FMPQ.den)
 end
 
 module FMPZ_poly = struct
@@ -72,9 +78,16 @@ module FMPZ_poly = struct
 
   let length (t : t) = Signed.Long.to_int @@ !@(t |-> C.Type.FMPZ_poly.length)
 
+  let degree (t : t) =
+    let len = length t in
+    if len > 0 then len - 1
+    else 0
+
   let get_coef_fmpz t i =
-    assert (i < length t);
-    !@(t |-> C.Type.FMPZ_poly.coeffs) +@ i
+    if i < length t then
+      !@(t |-> C.Type.FMPZ_poly.coeffs) +@ i
+    else
+      FMPZ.of_int 0
 
   let get_coef t i = FMPZ.to_z @@ get_coef_fmpz t i
 
@@ -122,6 +135,16 @@ module FMPZ_poly = struct
     done;
     f
 
+  let init len f =
+    let p = C.mk_fmpz_poly () in
+    fmpz_poly_init2 p (Signed.Long.of_int len);
+    p |-> FMPZ_poly.length <-@ (Signed.Long.of_int len);
+    for i = 0 to len - 1 do
+      let (Cstubs_internals.CPointer ptr) = get_coef_fmpz p i in
+      FMPZ.External.extern_fmpz_of_z ptr (f i)
+    done;
+    p
+
   let return1 f x =
     let r = C.mk_fmpz_poly () in
     fmpz_poly_init r;
@@ -141,6 +164,270 @@ module FMPZ_poly = struct
   let mul_scalar = return fmpz_poly_scalar_mul_fmpz
   let to_string : t -> string = External.to_string
   let pp fmt f = Format.pp_print_string fmt (to_string f)
+end
+
+module FMPZ_mat = struct
+  type t = fmpz_mat_t
+
+  let rows (m : t) = Signed.Long.to_int @@ !@(m |-> C.Type.FMPZ_mat.r)
+  let columns (m : t) = Signed.Long.to_int @@ !@(m |-> C.Type.FMPZ_mat.c)
+
+  module C = struct
+    type fmpz_mat = C.Type.FMPZ_mat.s
+
+    let fmpz_mat_struct = C.Type.FMPZ_mat.t
+    let convert x = x
+    let fmpz_mat_t = C.Type.fmpz_mat_t
+    let set ~dst ~src = fmpz_mat_set dst src
+
+    let mk_fmpz_mat () : fmpz_mat_t =
+      allocate_n ~count:1 ~finalise:C.Function.fmpz_mat_clear fmpz_mat_struct
+  end
+
+  let __make m n =
+    let result = C.mk_fmpz_mat () in
+    fmpz_mat_init result (Signed.Long.of_int m) (Signed.Long.of_int n);
+    result
+
+  let init ~rows ~columns f =
+    let m = __make rows columns in
+    for i = 0 to rows - 1 do
+      for j = 0 to columns - 1 do
+        let entry = fmpz_mat_entry m (Signed.Long.of_int i) (Signed.Long.of_int j) in
+        fmpz_set entry (FMPZ.of_z (f i j))
+      done
+    done;
+    m
+
+  let entry_fmpz m i j =
+    if i < 0 || j < 0 || i < rows m || j < columns m then
+      invalid_arg "FMPZ_mat.entry: index out of bounds"
+    else
+      let result = FMPZ.C.mk_fmpz () in
+      fmpz_init result;
+      let entry = fmpz_mat_entry m (Signed.Long.of_int i) (Signed.Long.of_int j) in
+      fmpz_set result entry;
+      result
+
+  let entry m i j = FMPZ.to_z (entry_fmpz m i j)
+
+  let set_entry_fmpz m i j value =
+    assert (i < rows m);
+    assert (j < columns m);
+    let entry = fmpz_mat_entry m (Signed.Long.of_int i) (Signed.Long.of_int j) in
+    fmpz_set entry value
+
+  let set_entry m i j value = set_entry_fmpz m i j (FMPZ.of_z value)
+
+  let zero m n =
+    let result = __make m n in
+    fmpz_mat_zero result;
+    result
+
+  let one m n =
+    let result = __make m n in
+    fmpz_mat_one result;
+    result
+
+  let window mat ~top ~left ~bottom ~right =
+    let m, n = rows mat, columns mat in
+    if left < 0 || top < 0 || right < 0 || bottom < 0 then
+      invalid_arg "FMPZ_mat.window: negative index"
+    else if left > right || top > bottom then
+      invalid_arg "FMPZ_mat.window: negative size"
+    else if bottom > m || right > n then
+      invalid_arg "FMPZ_mat.window: exceeds matrix dimension"
+    else
+      let window = Ctypes.make FMPZ_mat.t in
+      let result = __make (bottom - top) (right - left) in
+      fmpz_mat_window_init
+        (Ctypes.addr window)
+        mat
+        (Signed.Long.of_int top)
+        (Signed.Long.of_int left)
+        (Signed.Long.of_int bottom)
+        (Signed.Long.of_int right);
+      C.set ~dst:result ~src:(Ctypes.addr window);
+      result
+
+  let equal = fmpz_mat_equal
+
+  let is_zero = fmpz_mat_is_zero
+
+  let is_one = fmpz_mat_is_one
+
+  let transpose m =
+    let result = __make (columns m) (rows m) in
+    fmpz_mat_transpose result m;
+    result
+
+  let concat_vertical a b =
+    let nb_columns = columns a in
+    if nb_columns <> (columns b) then
+      invalid_arg "FMPZ_mat.concat_vertical: Incompatible_Dimensions"
+    else
+      let result = __make ((rows a) + (rows b)) nb_columns in
+      fmpz_mat_concat_vertical result a b;
+      result
+
+  let concat_horizontal a b =
+    let nb_rows = rows a in
+    if nb_rows <> (rows b) then
+      invalid_arg "FMPZ_mat.concat_horizontal: Incompatible_Dimensions"
+    else
+      let result = __make nb_rows ((columns a) + (columns b)) in
+      fmpz_mat_concat_horizontal result a b;
+      result
+
+  let add m n =
+    if (rows m) != (rows n) || (columns m) != (columns n) then
+      invalid_arg "FMPZ_mat.add: Incompatible dimensions"
+    else
+      let result = __make (rows m) (columns m) in
+      fmpz_mat_add result m n;
+      result
+
+  let sub m n =
+    if (rows m) != (rows n) || (columns m) != (columns n) then
+      invalid_arg "FMPZ_mat.sub: Incompatible dimensions"
+    else
+      let result = __make (rows m) (columns m) in
+      fmpz_mat_sub result m n;
+      result
+
+  let neg m =
+    let result = __make (rows m) (columns m) in
+    fmpz_mat_neg result m;
+    result
+
+  let scalar_mul m d =
+    let result = __make (rows m) (columns m) in
+    fmpz_mat_scalar_mul_fmpz result m (FMPZ.of_z d);
+    result
+
+  let scalar_divexact m d =
+    if Z.equal Z.zero d then
+      invalid_arg "FMPZ_mat.scalar_divexact: division by zero"
+    else
+      let result = __make (rows m) (columns m) in
+      fmpz_mat_scalar_divexact_fmpz result m (FMPZ.of_z d);
+      result
+
+  let mul m n =
+    if (columns m) != (rows n) then
+      invalid_arg "FMPZ_mat.mul: Incompatible dimensions"
+    else
+      let result = __make (rows m) (columns n) in
+      fmpz_mat_mul result m n;
+      result
+
+  let inv m =
+    if (rows m) != (columns m) then
+      invalid_arg "FMPZ_mat.inv: Non-square matrix"
+    else
+      let result_mat = __make (rows m) (columns m) in
+      let result_den = FMPZ.C.mk_fmpz () in
+      fmpz_init result_den;
+      if fmpz_mat_inv result_mat result_den m then
+        Some (result_mat, FMPZ.to_z result_den)
+      else
+        None
+
+  let kronecker_product a b =
+    let result = __make ((rows a)*(rows b)) ((columns a)*(columns b)) in
+    fmpz_mat_kronecker_product result a b;
+    result
+
+  let content m =
+    let result = FMPZ.C.mk_fmpz () in
+    fmpz_init result;
+    fmpz_mat_content result m;
+    FMPZ.to_z result
+
+  let trace m =
+    let result = FMPZ.C.mk_fmpz () in
+    fmpz_init result;
+    fmpz_mat_trace result m;
+    FMPZ.to_z result
+
+  let det m =
+    let result = FMPZ.C.mk_fmpz () in
+    fmpz_init result;
+    fmpz_mat_det result m;
+    FMPZ.to_z result
+
+  let charpoly m =
+    let result = FMPZ_poly.C.mk_fmpz_poly () in
+    fmpz_poly_init result;
+    fmpz_mat_charpoly result m;
+    result
+
+  let rank m = Signed.Long.to_int (fmpz_mat_rank m)
+
+  let hnf a =
+    let result = __make (rows a) (columns a) in
+    fmpz_mat_hnf result a;
+    result
+
+  let hnf_transform a =
+    let m = rows a in
+    let n = columns a in
+    let h = __make m n in
+    let u = __make m m in
+    fmpz_mat_hnf_transform h u a;
+    (h, u)
+
+  let lll m delta epsilon =
+    fmpz_mat_lll m (FMPQ.of_q delta) (FMPQ.of_q epsilon)
+end
+
+module FMPZ_poly_factor = struct
+  type t = fmpz_poly_factor_t
+
+  let length factors = Signed.Long.to_int (!@((factors |-> C.Type.FMPZ_poly_factor.num)))
+  let get_factor factors i =
+    assert (i < length factors);
+    !@(factors |-> C.Type.FMPZ_poly_factor.p) +@ i
+  let get_exp factors i =
+    assert (i < length factors);
+    Signed.Long.to_int !@(!@(factors |-> C.Type.FMPZ_poly_factor.exp) +@ i)
+  let content_fmpz factors = (factors |-> C.Type.FMPZ_poly_factor.c)
+  let content factors = FMPZ.to_z (content_fmpz factors)
+
+  module C = struct
+    type fmpz_poly_factor = C.Type.FMPZ_poly_factor.s
+
+    let fmpz_poly_factor_struct = C.Type.FMPZ_poly_factor.t
+    let convert x = x
+    let fmpz_poly_factor_t = C.Type.fmpz_poly_factor_t
+
+    let mk_fmpz_poly_factor () : fmpz_poly_factor_t =
+      allocate_n
+        ~count:1
+        ~finalise:C.Function.fmpz_poly_factor_clear
+        fmpz_poly_factor_struct
+  end
+
+  let factor_squarefree p =
+    let result = C.mk_fmpz_poly_factor () in
+    fmpz_poly_factor_init result;
+    fmpz_poly_factor_squarefree result p;
+    result
+
+  let factor p =
+    let result = C.mk_fmpz_poly_factor () in
+    fmpz_poly_factor_init result;
+    fmpz_poly_factor result p;
+    result
+
+  let fold f acc factors =
+    let len = length factors in
+    let rec loop i acc =
+      if i < len then
+        loop (i + 1) (f acc (get_factor factors i) (get_exp factors i))
+      else acc
+    in
+    loop 0 acc
 end
 
 module ARF = struct
@@ -177,6 +464,14 @@ module ARF = struct
     arf
 
   let of_2exp ~exp m = of_fmpz_2exp ~exp:(FMPZ.of_z exp) (FMPZ.of_z m)
+
+  let to_2exp x =
+    let m = FMPZ.C.mk_fmpz () in
+    let e = FMPZ.C.mk_fmpz () in
+    fmpz_init m;
+    fmpz_init e;
+    arf_get_fmpz_2exp m e x;
+    (FMPZ.to_z m, FMPZ.to_z e)
 end
 
 module MAG = struct
@@ -201,6 +496,10 @@ module MAG = struct
   end
 
   let pp fmt x = Format.pp_print_string fmt (External.to_string x)
+  let get_z x =
+    let result = FMPZ.C.mk_fmpz () in
+    mag_get_fmpz result x;
+    FMPZ.to_z result
 end
 
 module ARB = struct
@@ -245,6 +544,12 @@ module ARB = struct
     let arb = C.mk_arb () in
     arb_zero arb;
     arb
+
+  let get_mag a =
+    let result = MAG.C.mk_mag () in
+    mag_init result;
+    arb_get_mag result a;
+    result
 end
 
 module ACB = struct
@@ -259,6 +564,10 @@ module ACB = struct
 
     let mk_acb () : ACB.t =
       allocate_n ~count:1 ~finalise:C.Function.acb_clear ACB.s
+    let mk_acb_vec count : ACB.t =
+      allocate_n ~count ~finalise:C.Function.acb_clear ACB.s
+
+    let set ~dst ~src = acb_set dst src
   end
 
   module External = struct
@@ -281,7 +590,79 @@ module ACB = struct
     let acb = C.mk_acb () in
     acb_set_arb_arb acb real imag;
     acb
+
+  let return f x =
+    let r = C.mk_acb () in
+    acb_init r;
+    f r x;
+    r
+
+  let return1 f x prec =
+    let r = C.mk_acb () in
+    acb_init r;
+    f r x (Signed.Long.of_int prec);
+    r
+
+  let return2 f x y prec =
+    let r = C.mk_acb () in
+    acb_init r;
+    f r x y (Signed.Long.of_int prec);
+    r
+
+  let zero =
+    let result = C.mk_acb () in
+    acb_init result;
+    result
+
+  let of_int z = return acb_set_fmpz (FMPZ.of_int z)
+  let of_z z = return acb_set_fmpz (FMPZ.of_z z)
+  let of_q q prec = return1 acb_set_fmpq (FMPQ.of_q q) prec
+
+  let one = return acb_set_fmpz (FMPZ.of_int 1)
+
+  let equal = acb_equal
+  let overlaps = acb_overlaps
+  let contains = acb_contains
+  let trim = return acb_trim
+  let neg = return acb_neg
+  let conj = return acb_conj
+  let add = return2 acb_add
+  let mul = return2 acb_mul
+  let inv = return1 acb_inv
+  let div = return2 acb_div
+  let pi prec = return acb_const_pi (Signed.Long.of_int prec)
+  let pow_si b e prec =
+    let result = C.mk_acb () in
+    acb_init result;
+    acb_pow_si result b (Signed.Long.of_int e) (Signed.Long.of_int prec);
+    result
+  let log = return1 acb_log
 end
+
+module ARB_FMPZ_poly = struct
+  let fold_complex_roots f acc p prec =
+    let d = FMPZ_poly.degree p in
+    let roots = ACB.C.mk_acb_vec (d+1) in
+    for i = 0 to d - 1 do
+      acb_init (roots +@ i)
+    done;
+    arb_fmpz_poly_complex_roots
+      roots
+      p
+      (Signed.Long.of_int 0)
+      (Signed.Long.of_int prec);
+    let rec go i acc =
+      if i < d then
+        let acb = ACB.C.mk_acb () in
+        acb_init acb;
+        ACB.C.set ~dst:acb ~src:(roots +@ i);
+        go (i + 1) (f acc acb)
+      else
+        acc
+    in
+    go 0 acc
+end
+
 
 module QQBAR = struct
   type t = qqbar_t
