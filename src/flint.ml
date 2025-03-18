@@ -200,7 +200,7 @@ module FMPZ_mat = struct
     m
 
   let entry_fmpz m i j =
-    if i < 0 || j < 0 || i < rows m || j < columns m then
+    if i < 0 || j < 0 || i > rows m || j > columns m then
       invalid_arg "FMPZ_mat.entry: index out of bounds"
     else
       let result = FMPZ.C.mk_fmpz () in
